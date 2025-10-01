@@ -16,6 +16,8 @@ class Node:
     """
     A Node represents a value in the computation graph. It stores the value,
     its parents, the operation that produced it, and its gradient.
+    
+    Enhanced with float64 gradient accumulation for numerical stability.
     """
     def __init__(self, value: Any, parents: Iterable['Node'] = (), op: str = '', requires_grad: bool = True):
         # print(f"Node.__init__ called with value type: {type(value)}, op: {op}") # Debug print
@@ -38,21 +40,15 @@ class Node:
 
         self.parents = tuple(parents)
         self.op = op
-        self.grad: Optional[np.ndarray] = None # Gradient is None initially
+        self.grad: Optional[np.ndarray] = None
         self._backward = lambda: None
-
 
     def _ensure(self, other: Any) -> 'Node':
         """Ensures the other operand is a Node."""
-        # print(f"Node._ensure called with type: {type(other)}") # Debug print
-        # Corrected check to use the current Node class
         if isinstance(other, self.__class__):
-            # print("  _ensure: Input is already a Node, returning it.") # Debug print
             return other
         else:
-            # print("  _ensure: Input is not a Node, creating a new Node.") # Debug print
-            return Node(other, requires_grad=False) # Ensure constants don't require grad
-
+            return Node(other, requires_grad=False)
 
     def __add__(self, other: Any) -> 'Node':
         # print(f"Node.__add__ called with self type: {type(self)}, other type: {type(other)}") # Debug print
@@ -62,8 +58,12 @@ class Node:
         out = Node(out_value, (self, other), '+')
         def _backward():
             if out.grad is None: return
-            if self.requires_grad: self.grad += _sum_to_shape(out.grad, self.value.shape)
-            if other.requires_grad: other.grad += _sum_to_shape(out.grad, other.value.shape)
+            if self.requires_grad: 
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += _sum_to_shape(out.grad.astype(np.float64), self.value.shape)
+            if other.requires_grad: 
+                other.grad = other.grad.astype(np.float64) if other.grad is not None else np.zeros_like(other.value, dtype=np.float64)
+                other.grad += _sum_to_shape(out.grad.astype(np.float64), other.value.shape)
         out._backward = _backward
         return out
 
@@ -76,8 +76,12 @@ class Node:
         def _backward():
             if out.grad is None: return
             # Gradients should be multiplied by the other operand's value
-            if self.requires_grad: self.grad += _sum_to_shape(out.grad * other.value, self.value.shape)
-            if other.requires_grad: other.grad += _sum_to_shape(out.grad * self.value, other.value.shape)
+            if self.requires_grad: 
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += _sum_to_shape((out.grad * other.value).astype(np.float64), self.value.shape)
+            if other.requires_grad: 
+                other.grad = other.grad.astype(np.float64) if other.grad is not None else np.zeros_like(other.value, dtype=np.float64)
+                other.grad += _sum_to_shape((out.grad * self.value).astype(np.float64), other.value.shape)
         out._backward = _backward
         return out
 
@@ -147,10 +151,77 @@ class Node:
         out._backward = _backward
         return out
 
+    def __neg__(self) -> 'Node':
+        """Negation: -x"""
+        out_value = -self.value
+        out = Node(out_value, (self,), 'neg')
+        def _backward():
+            if self.requires_grad and out.grad is not None:
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += -out.grad.astype(np.float64)
+        out._backward = _backward
+        return out
+
+    def __sub__(self, other: Any) -> 'Node':
+        """Subtraction: self - other"""
+        return self + (-self._ensure(other))
+
+    def __rsub__(self, other: Any) -> 'Node':
+        """Reverse subtraction: other - self"""
+        return self._ensure(other) + (-self)
+
+    def __truediv__(self, other: Any) -> 'Node':
+        """Division: self / other"""
+        other = self._ensure(other)
+        out_value = self.value / other.value
+        out = Node(out_value, (self, other), '/')
+        def _backward():
+            if out.grad is None: return
+            if self.requires_grad:
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += _sum_to_shape((out.grad / other.value).astype(np.float64), self.value.shape)
+            if other.requires_grad:
+                other.grad = other.grad.astype(np.float64) if other.grad is not None else np.zeros_like(other.value, dtype=np.float64)
+                other.grad += _sum_to_shape((-out.grad * self.value / (other.value ** 2)).astype(np.float64), other.value.shape)
+        out._backward = _backward
+        return out
+
+    def __rtruediv__(self, other: Any) -> 'Node':
+        """Reverse division: other / self"""
+        return self._ensure(other) / self
+
+    def __radd__(self, other: Any) -> 'Node':
+        """Reverse addition: other + self"""
+        return self + other
+
+    def __rmul__(self, other: Any) -> 'Node':
+        """Reverse multiplication: other * self"""
+        return self * other
+
+    def exp(self) -> 'Node':
+        """Exponential: e^x"""
+        out_value = np.exp(self.value)
+        out = Node(out_value, (self,), 'exp')
+        def _backward():
+            if self.requires_grad and out.grad is not None:
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += (out.grad * out.value).astype(np.float64)
+        out._backward = _backward
+        return out
+
+    def log(self) -> 'Node':
+        """Natural logarithm: ln(x)"""
+        out_value = np.log(self.value + 1e-15)  # Add epsilon for numerical stability
+        out = Node(out_value, (self,), 'log')
+        def _backward():
+            if self.requires_grad and out.grad is not None:
+                self.grad = self.grad.astype(np.float64) if self.grad is not None else np.zeros_like(self.value, dtype=np.float64)
+                self.grad += (out.grad / (self.value + 1e-15)).astype(np.float64)
+        out._backward = _backward
+        return out
 
     def backward(self):
         """Performs backpropagation to compute gradients for all nodes."""
-        # print(f"Node.backward called on node with op: {self.op}") # Debug print
         topo, visited = [], set()
         def build_topo(v):
             if v not in visited:
@@ -160,32 +231,32 @@ class Node:
 
         build_topo(self)
 
-        # Initialize gradients to zero for all nodes that require grad
         for v in topo:
             if v.requires_grad:
-                 v.grad = np.zeros_like(v.value, dtype=np.float32)
+                v.grad = np.zeros_like(v.value, dtype=np.float64)
 
-        # Set the gradient of the output node to 1 if it requires grad
         if self.requires_grad:
-            # Ensure the gradient is initialized before adding to it
             if self.grad is None:
-                 self.grad = np.ones_like(self.value, dtype=np.float32)
+                self.grad = np.ones_like(self.value, dtype=np.float64)
             else:
-                self.grad += np.ones_like(self.value, dtype=np.float32)
+                self.grad += np.ones_like(self.value, dtype=np.float64)
         else:
-             # If the output does not require gradients, there is nothing to backpropagate
-             # print("  backward: Output node does not require grad, stopping.") # Debug print
-             return
-
+            return
 
         for v in reversed(topo):
-            # print(f"  backward: Processing node with op: {v.op}, requires_grad: {v.requires_grad}") # Debug print
             v._backward()
-            # if v.grad is not None:
-            #      print(f"  backward: Gradient calculated for node with op: {v.op}, shape: {v.grad.shape}") # Debug print
-            # else:
-            #      print(f"  backward: No gradient for node with op: {v.op}") # Debug print
-
 
     def __repr__(self) -> str:
         return f"Node(value={self.value.shape}, op='{self.op}')"
+
+class Parameter(Node):
+    """
+    A Parameter is a special Node that represents a trainable parameter.
+    It always requires gradients and provides additional utilities.
+    """
+    def __init__(self, value: Any):
+        super().__init__(value, requires_grad=True)
+        self.is_parameter = True
+
+    def __repr__(self) -> str:
+        return f"Parameter(shape={self.value.shape})"

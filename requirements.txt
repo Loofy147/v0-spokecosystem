@@ -8,3 +8,8 @@ torch
 torchvision
 gymnasium[box2d]
 google-genai
+tqdm
+wandb
+faiss-cpu
+redis
+prometheus-client
